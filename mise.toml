@@ -1,0 +1,12 @@
+[settings]
+python.uv_venv_auto = "create|source"
+
+[tasks.coverage]
+description = "Run coverage tests"
+run = '''
+uv run coverage run --omit='tests/*' -m pytest
+'''
+
+[tasks.coverage-report]
+description = "Generate coverage report"
+run = "uv run coverage html"

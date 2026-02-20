@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import os
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar, cast
 from urllib.parse import urlparse
 
-import boto3
+import aioboto3
 import click
 import questionary
 from botocore.exceptions import ClientError
 
-S3Client = Any
+AsyncS3Client = Any
+T = TypeVar("T")
+U = TypeVar("U")
 
 
 class TargetMode(str, Enum):
@@ -36,17 +41,23 @@ class VersionEntry:
     is_latest: bool
 
 
+@dataclass(frozen=True)
+class PlannedRestore:
+    key: str
+    version_id: str
+
+
+@dataclass(frozen=True)
+class RestorePlan:
+    ready: list[PlannedRestore]
+    insufficient_keys: list[str]
+
+
 @dataclass
 class RunReport:
     restored: int = 0
     skipped: int = 0
     failed: int = 0
-
-
-class InsufficientChoice(str, Enum):
-    SKIP_THIS = "skip_this"
-    SKIP_ALL = "skip_all"
-    ABORT = "abort"
 
 
 def parse_s3_url(raw_url: str) -> TargetSpec:
@@ -91,8 +102,26 @@ def parse_as_of_timestamp(raw_value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def check_versioning_enabled(s3_client: S3Client, bucket: str) -> None:
-    response = s3_client.get_bucket_versioning(Bucket=bucket)
+def default_max_workers() -> int:
+    return min(32, (os.cpu_count() or 1) * 5)
+
+
+def resolve_max_workers(requested: int | None) -> int:
+    return requested if requested is not None else default_max_workers()
+
+
+async def _iterate_pages(pages: Any) -> AsyncIterator[dict[str, Any]]:
+    if hasattr(pages, "__aiter__"):
+        async for page in cast(Any, pages):
+            yield cast(dict[str, Any], page)
+        return
+
+    for page in cast(Iterable[Any], pages):
+        yield cast(dict[str, Any], page)
+
+
+async def check_versioning_enabled(s3_client: AsyncS3Client, bucket: str) -> None:
+    response = await s3_client.get_bucket_versioning(Bucket=bucket)
     status = response.get("Status")
     if status != "Enabled":
         raise click.ClickException(
@@ -100,9 +129,9 @@ def check_versioning_enabled(s3_client: S3Client, bucket: str) -> None:
         )
 
 
-def bucket_exists(s3_client: S3Client, bucket: str) -> bool:
+async def bucket_exists(s3_client: AsyncS3Client, bucket: str) -> bool:
     try:
-        s3_client.head_bucket(Bucket=bucket)
+        await s3_client.head_bucket(Bucket=bucket)
         return True
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
@@ -111,7 +140,7 @@ def bucket_exists(s3_client: S3Client, bucket: str) -> bool:
         raise
 
 
-def list_candidate_keys(s3_client: S3Client, target: TargetSpec) -> list[str]:
+async def list_candidate_keys(s3_client: AsyncS3Client, target: TargetSpec) -> list[str]:
     if target.mode == TargetMode.EXACT:
         if target.key is None:
             return []
@@ -119,9 +148,10 @@ def list_candidate_keys(s3_client: S3Client, target: TargetSpec) -> list[str]:
 
     prefix = target.prefix or ""
     paginator = s3_client.get_paginator("list_objects_v2")
-    keys: list[str] = []
+    pages = paginator.paginate(Bucket=target.bucket, Prefix=prefix)
 
-    for page in paginator.paginate(Bucket=target.bucket, Prefix=prefix):
+    keys: list[str] = []
+    async for page in _iterate_pages(pages):
         for item in page.get("Contents", []):
             key = item.get("Key")
             if isinstance(key, str) and key:
@@ -138,11 +168,14 @@ def _coerce_datetime(value: Any) -> datetime:
     raise click.ClickException("Encountered S3 version without valid LastModified timestamp.")
 
 
-def list_object_versions(s3_client: S3Client, bucket: str, key: str) -> list[VersionEntry]:
+async def list_object_versions(
+    s3_client: AsyncS3Client, bucket: str, key: str
+) -> list[VersionEntry]:
     paginator = s3_client.get_paginator("list_object_versions")
-    entries: list[VersionEntry] = []
+    pages = paginator.paginate(Bucket=bucket, Prefix=key)
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=key):
+    entries: list[VersionEntry] = []
+    async for page in _iterate_pages(pages):
         for item in page.get("Versions", []):
             item_key = item.get("Key")
             version_id = item.get("VersionId")
@@ -201,10 +234,87 @@ def select_version_as_of(
     return None
 
 
+async def _run_worker_pool(
+    items: list[T], max_workers: int, worker: Callable[[T], Coroutine[Any, Any, U]]
+) -> list[U]:
+    if not items:
+        return []
+
+    iterator = iter(items)
+    active: set[asyncio.Task[U]] = set()
+    results: list[U] = []
+
+    def schedule_one() -> bool:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return False
+        active.add(asyncio.create_task(worker(item)))
+        return True
+
+    for _ in range(min(max_workers, len(items))):
+        if not schedule_one():
+            break
+
+    while active:
+        done, pending = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+        active = set(pending)
+
+        for task in done:
+            results.append(task.result())
+
+        while len(active) < max_workers:
+            if not schedule_one():
+                break
+
+    return results
+
+
+@dataclass(frozen=True)
+class _SelectionResult:
+    key: str
+    selected: VersionEntry | None
+
+
+async def build_restore_plan(
+    s3_client: AsyncS3Client,
+    bucket: str,
+    keys: list[str],
+    versions: int | None,
+    as_of_timestamp: datetime | None,
+    ignore_delete_markers: bool,
+    max_workers: int,
+) -> RestorePlan:
+    async def process_key(key: str) -> _SelectionResult:
+        entries = await list_object_versions(s3_client, bucket, key)
+        selected: VersionEntry | None
+        if as_of_timestamp is not None:
+            selected = select_version_as_of(entries, as_of_timestamp, ignore_delete_markers)
+        else:
+            versions_back = versions if versions is not None else 1
+            selected = select_version_by_depth(entries, versions_back, ignore_delete_markers)
+        return _SelectionResult(key=key, selected=selected)
+
+    results = await _run_worker_pool(keys, max_workers=max_workers, worker=process_key)
+
+    ready: list[PlannedRestore] = []
+    insufficient: list[str] = []
+
+    for result in results:
+        if result.selected is None:
+            insufficient.append(result.key)
+            continue
+        ready.append(PlannedRestore(key=result.key, version_id=result.selected.version_id))
+
+    return RestorePlan(ready=ready, insufficient_keys=insufficient)
+
+
 def render_selection_mode(
     versions: int | None, as_of_timestamp: datetime | None, ignore_delete_markers: bool
 ) -> str:
-    marker_mode = "excluding delete markers" if ignore_delete_markers else "including delete markers"
+    marker_mode = (
+        "excluding delete markers" if ignore_delete_markers else "including delete markers"
+    )
     if as_of_timestamp is not None:
         return f"as-of timestamp {as_of_timestamp.isoformat()} ({marker_mode})"
     if versions is None:
@@ -218,53 +328,6 @@ def prompt_confirm(message: str) -> None:
         raise click.Abort()
 
 
-def choose_insufficient_action(key: str) -> InsufficientChoice:
-    selection = questionary.select(
-        f"Not enough versions for '{key}'. How should this be handled?",
-        choices=[
-            {"name": "Skip this key", "value": InsufficientChoice.SKIP_THIS.value},
-            {
-                "name": "Skip this and all future insufficient keys",
-                "value": InsufficientChoice.SKIP_ALL.value,
-            },
-            {"name": "Abort run", "value": InsufficientChoice.ABORT.value},
-        ],
-    ).ask()
-    if selection is None:
-        return InsufficientChoice.ABORT
-    return InsufficientChoice(selection)
-
-
-def ensure_target_bucket(s3_client: S3Client, target_bucket: str, target_region: str | None) -> None:
-    if bucket_exists(s3_client, target_bucket):
-        return
-
-    prompt_confirm(f"Target bucket '{target_bucket}' does not exist. Create it now?")
-
-    create_region = target_region or boto3.session.Session().region_name or "us-east-1"
-    if create_region == "us-east-1":
-        s3_client.create_bucket(Bucket=target_bucket)
-    else:
-        s3_client.create_bucket(
-            Bucket=target_bucket,
-            CreateBucketConfiguration={"LocationConstraint": create_region},
-        )
-
-
-def copy_version_to_destination(
-    s3_client: S3Client,
-    src_bucket: str,
-    key: str,
-    version_id: str,
-    dst_bucket: str,
-) -> None:
-    s3_client.copy_object(
-        Bucket=dst_bucket,
-        Key=key,
-        CopySource={"Bucket": src_bucket, "Key": key, "VersionId": version_id},
-    )
-
-
 def _sample_keys(keys: list[str], limit: int = 5) -> str:
     if not keys:
         return "(none)"
@@ -274,79 +337,192 @@ def _sample_keys(keys: list[str], limit: int = 5) -> str:
     return ", ".join(sample)
 
 
-def run_restore(
-    s3_client: S3Client,
+def prompt_continue_with_insufficient(insufficient_keys: list[str]) -> None:
+    click.echo(f"Insufficient history for {len(insufficient_keys)} key(s).")
+    click.echo(f"Sample insufficient keys: {_sample_keys(insufficient_keys)}")
+    prompt_confirm("Continue and skip these keys?")
+
+
+async def ensure_target_bucket(
+    s3_client: AsyncS3Client,
+    target_bucket: str,
+    target_region: str | None,
+    session_region: str | None,
+) -> None:
+    if await bucket_exists(s3_client, target_bucket):
+        return
+
+    prompt_confirm(f"Target bucket '{target_bucket}' does not exist. Create it now?")
+
+    create_region = target_region or session_region or "us-east-1"
+    if create_region == "us-east-1":
+        await s3_client.create_bucket(Bucket=target_bucket)
+    else:
+        await s3_client.create_bucket(
+            Bucket=target_bucket,
+            CreateBucketConfiguration={"LocationConstraint": create_region},
+        )
+
+
+@dataclass(frozen=True)
+class _CopyResult:
+    key: str
+    success: bool
+    error: str | None = None
+
+
+async def _copy_version_to_destination(
+    s3_client: AsyncS3Client,
+    src_bucket: str,
+    destination_bucket: str,
+    planned: PlannedRestore,
+) -> _CopyResult:
+    try:
+        await s3_client.copy_object(
+            Bucket=destination_bucket,
+            Key=planned.key,
+            CopySource={
+                "Bucket": src_bucket,
+                "Key": planned.key,
+                "VersionId": planned.version_id,
+            },
+        )
+    except ClientError as exc:
+        return _CopyResult(key=planned.key, success=False, error=str(exc))
+
+    return _CopyResult(key=planned.key, success=True)
+
+
+async def execute_copy_plan(
+    s3_client: AsyncS3Client,
+    source_bucket: str,
+    destination_bucket: str,
+    plan: RestorePlan,
+    max_workers: int,
+) -> RunReport:
+    report = RunReport()
+    if not plan.ready:
+        return report
+
+    active: set[asyncio.Task[_CopyResult]] = set()
+    next_index = 0
+    stop_scheduling = False
+
+    def schedule_next() -> bool:
+        nonlocal next_index
+        if next_index >= len(plan.ready):
+            return False
+        planned = plan.ready[next_index]
+        next_index += 1
+        active.add(
+            asyncio.create_task(
+                _copy_version_to_destination(
+                    s3_client=s3_client,
+                    src_bucket=source_bucket,
+                    destination_bucket=destination_bucket,
+                    planned=planned,
+                )
+            )
+        )
+        return True
+
+    while len(active) < max_workers:
+        if not schedule_next():
+            break
+
+    while active:
+        done, pending = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+        active = set(pending)
+
+        for task in done:
+            result = task.result()
+            if result.success:
+                report.restored += 1
+                click.echo(f"Restored '{result.key}'.")
+                continue
+
+            report.failed += 1
+            click.echo(f"Failed to restore '{result.key}': {result.error}")
+            stop_scheduling = True
+
+        if stop_scheduling:
+            continue
+
+        while len(active) < max_workers:
+            if not schedule_next():
+                break
+
+    if stop_scheduling and next_index < len(plan.ready):
+        skipped_due_to_failure = len(plan.ready) - next_index
+        report.skipped += skipped_due_to_failure
+        click.echo(
+            "Skipping "
+            f"{skipped_due_to_failure} remaining key(s) because a copy operation failed."
+        )
+
+    return report
+
+
+async def run_restore(
+    s3_client: AsyncS3Client,
     target: TargetSpec,
     versions: int | None,
     as_of_timestamp: datetime | None,
     ignore_delete_markers: bool,
     target_bucket: str | None,
     target_region: str | None,
+    max_workers: int,
+    session_region: str | None,
 ) -> RunReport:
-    report = RunReport()
     destination_bucket = target_bucket or target.bucket
 
-    check_versioning_enabled(s3_client, target.bucket)
-    keys = list_candidate_keys(s3_client, target)
+    await check_versioning_enabled(s3_client, target.bucket)
+    keys = await list_candidate_keys(s3_client, target)
     if not keys:
         click.echo("No matching keys found. No changes made.")
-        return report
+        return RunReport()
 
     selection = render_selection_mode(versions, as_of_timestamp, ignore_delete_markers)
     click.echo(f"Matched keys: {len(keys)}")
     click.echo(f"Destination bucket: {destination_bucket}")
     click.echo(f"Selection mode: {selection}")
+    click.echo(f"Max workers: {max_workers}")
     click.echo(f"Sample keys: {_sample_keys(keys)}")
     prompt_confirm("Proceed with restore operations?")
 
     if target_bucket:
-        ensure_target_bucket(s3_client, target_bucket, target_region)
+        await ensure_target_bucket(s3_client, target_bucket, target_region, session_region)
 
-    skip_all_insufficient = False
+    plan = await build_restore_plan(
+        s3_client=s3_client,
+        bucket=target.bucket,
+        keys=keys,
+        versions=versions,
+        as_of_timestamp=as_of_timestamp,
+        ignore_delete_markers=ignore_delete_markers,
+        max_workers=max_workers,
+    )
 
-    for key in keys:
-        entries = list_object_versions(s3_client, target.bucket, key)
-        selected: VersionEntry | None
-        if as_of_timestamp is not None:
-            selected = select_version_as_of(entries, as_of_timestamp, ignore_delete_markers)
-        else:
-            versions_back = versions if versions is not None else 1
-            selected = select_version_by_depth(entries, versions_back, ignore_delete_markers)
+    if plan.insufficient_keys:
+        prompt_continue_with_insufficient(plan.insufficient_keys)
 
-        if selected is None:
-            if skip_all_insufficient:
-                click.echo(f"Skipping '{key}': insufficient historical versions.")
-                report.skipped += 1
-                continue
+    report = RunReport(skipped=len(plan.insufficient_keys))
 
-            action = choose_insufficient_action(key)
-            if action == InsufficientChoice.SKIP_THIS:
-                click.echo(f"Skipping '{key}': insufficient historical versions.")
-                report.skipped += 1
-                continue
-            if action == InsufficientChoice.SKIP_ALL:
-                skip_all_insufficient = True
-                click.echo(f"Skipping '{key}': insufficient historical versions.")
-                report.skipped += 1
-                continue
-            raise click.Abort()
+    if not plan.ready:
+        click.echo("No eligible keys found after selection. No copy operations performed.")
+        return report
 
-        try:
-            copy_version_to_destination(
-                s3_client=s3_client,
-                src_bucket=target.bucket,
-                key=key,
-                version_id=selected.version_id,
-                dst_bucket=destination_bucket,
-            )
-        except ClientError as exc:
-            report.failed += 1
-            click.echo(f"Failed to restore '{key}': {exc}")
-            continue
+    copy_report = await execute_copy_plan(
+        s3_client=s3_client,
+        source_bucket=target.bucket,
+        destination_bucket=destination_bucket,
+        plan=plan,
+        max_workers=max_workers,
+    )
 
-        report.restored += 1
-        click.echo(f"Restored '{key}' from version '{selected.version_id}'.")
-
+    report.restored = copy_report.restored
+    report.failed = copy_report.failed
+    report.skipped += copy_report.skipped
     return report
 
 
@@ -382,6 +558,12 @@ def run_restore(
     default=None,
     help="Region used when creating a missing target bucket.",
 )
+@click.option(
+    "--max-workers",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum number of concurrent S3 operations. Defaults to a conservative auto value.",
+)
 def cli(
     s3_url: str,
     versions: int | None,
@@ -389,23 +571,34 @@ def cli(
     ignore_delete_markers: bool,
     target_bucket: str | None,
     target_region: str | None,
+    max_workers: int | None,
 ) -> None:
     if versions is not None and as_of_timestamp is not None:
         raise click.ClickException("Use either --versions or --as-of-timestamp, not both.")
 
     parsed_target = parse_s3_url(s3_url)
-    parsed_timestamp = parse_as_of_timestamp(as_of_timestamp) if as_of_timestamp is not None else None
-    s3_client = boto3.client("s3")
-
-    report = run_restore(
-        s3_client=s3_client,
-        target=parsed_target,
-        versions=versions,
-        as_of_timestamp=parsed_timestamp,
-        ignore_delete_markers=ignore_delete_markers,
-        target_bucket=target_bucket,
-        target_region=target_region,
+    parsed_timestamp = (
+        parse_as_of_timestamp(as_of_timestamp) if as_of_timestamp is not None else None
     )
+    resolved_workers = resolve_max_workers(max_workers)
+
+    session = aioboto3.Session()
+
+    async def _run() -> RunReport:
+        async with session.client("s3") as s3_client:
+            return await run_restore(
+                s3_client=s3_client,
+                target=parsed_target,
+                versions=versions,
+                as_of_timestamp=parsed_timestamp,
+                ignore_delete_markers=ignore_delete_markers,
+                target_bucket=target_bucket,
+                target_region=target_region,
+                max_workers=resolved_workers,
+                session_region=session.region_name,
+            )
+
+    report = asyncio.run(_run())
 
     click.echo(
         f"Completed. Restored={report.restored}, Skipped={report.skipped}, Failed={report.failed}."

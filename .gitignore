@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+htmlcov/
+.coverage
+
+.vscode/
+.DS_Store
+.env
+.envrc
+*.asc
+*.pyc
+*.egg-info/
+**/__pycache__/*
