@@ -378,15 +378,28 @@ async def _copy_version_to_destination(
     planned: PlannedRestore,
 ) -> _CopyResult:
     try:
-        await s3_client.copy_object(
-            Bucket=destination_bucket,
-            Key=planned.key,
-            CopySource={
+        copy_kwargs: dict[str, Any] = {
+            "Bucket": destination_bucket,
+            "Key": planned.key,
+            "CopySource": {
                 "Bucket": src_bucket,
                 "Key": planned.key,
                 "VersionId": planned.version_id,
             },
-        )
+        }
+
+        if src_bucket == destination_bucket:
+            head = await s3_client.head_object(
+                Bucket=src_bucket,
+                Key=planned.key,
+                VersionId=planned.version_id,
+            )
+            metadata = dict(head.get("Metadata", {}))
+            metadata["aws-s3-ohfuck-restored-from-version"] = planned.version_id
+            copy_kwargs["MetadataDirective"] = "REPLACE"
+            copy_kwargs["Metadata"] = metadata
+
+        await s3_client.copy_object(**copy_kwargs)
     except ClientError as exc:
         return _CopyResult(key=planned.key, success=False, error=str(exc))
 

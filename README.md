@@ -139,3 +139,19 @@ uv run ruff check
 ```
 
 No change is complete unless `ty check` and `ruff check` pass.
+
+## Live Integration Tests (Testcontainers + S3)
+
+Live tests use a Dockerized LocalStack S3 service via `testcontainers`.
+
+Run them explicitly:
+
+```bash
+RUN_LIVE_TESTS=1 uv run pytest -m live -q
+```
+
+Notes:
+
+- Docker must be running.
+- Live tests are skipped unless `RUN_LIVE_TESTS=1` is set.
+- Standard `uv run pytest -q` remains fast and runs unit tests by default.

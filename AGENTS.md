@@ -14,10 +14,13 @@
 
 - Install deps / sync lockfile: `uv lock`
 - Run tests: `uv run pytest -q`
+- Run live S3 integration tests: `RUN_LIVE_TESTS=1 uv run pytest -m live -q`
 - Type checks (required): `uv run ty check`
 - Lint checks (required): `uv run ruff check`
 
 No task is complete unless `uv run ty check` and `uv run ruff check` pass.
+
+Live tests require Docker and use `testcontainers` + LocalStack S3.
 
 ## Behavioral constraints
 

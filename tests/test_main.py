@@ -55,6 +55,9 @@ class _FakeAsyncS3Client:
     async def head_bucket(self, **_: Any) -> None:
         return None
 
+    async def head_object(self, **_: Any) -> dict[str, Any]:
+        return {"Metadata": {}}
+
     async def create_bucket(self, **_: Any) -> None:
         return None
 
