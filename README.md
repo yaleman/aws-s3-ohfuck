@@ -3,6 +3,8 @@
 > [!NOTE]
 >
 > This is mostly vibe-coded nonsense, use at your own risk. Worse, I touched some of the code so I'd probably say not to use it at all.
+>
+> I'm going to archive this for now but email me if you want to do dev on it or whatever :D
 
 Restore S3 objects to historical versions with a safety-first CLI.
 
