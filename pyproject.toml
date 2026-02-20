@@ -1,0 +1,25 @@
+[project]
+name = "aws-s3-ohfuck"
+version = "0.1.0"
+description = "Rollback S3 objects to historical versions safely."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["boto3>=1.40.0", "click>=8.1.0", "questionary>=2.1.0"]
+
+[project.scripts]
+aws-s3-ohfuck = "aws_s3_ohfuck.cli:cli"
+
+[dependency-groups]
+dev = ["pytest>=8.3.0", "ruff>=0.12.0", "ty>=0.0.1a16"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aws_s3_ohfuck"]
