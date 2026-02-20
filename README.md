@@ -1,5 +1,9 @@
 # aws-s3-ohfuck
 
+> [!NOTE]
+>
+> This is mostly vibe-coded nonsense, use at your own risk. Worse, I touched some of the code so I'd probably say not to use it at all.
+
 Restore S3 objects to historical versions with a safety-first CLI.
 
 This tool:
@@ -26,6 +30,28 @@ This tool:
 ```bash
 uv lock
 uv run aws-s3-ohfuck --help
+```
+
+or use `uvx`:
+
+```bash
+$ uvx --with 'git+https://github.com/yaleman/aws-s3-ohfuck' aws-s3-ohfuck --help
+Usage: aws-s3-ohfuck [OPTIONS] S3_URL
+
+Options:
+  --versions INTEGER RANGE     How many steps back from the current head
+                               version to restore.  [x>=1]
+  --as-of-timestamp TEXT       ISO-8601 timestamp; restore to the latest
+                               version at or before this time.
+  --ignore-delete-markers      Ignore delete markers when selecting rollback
+                               candidates.
+  --target-bucket TEXT         Destination bucket for restored copies.
+                               Defaults to source bucket.
+  --target-region TEXT         Region used when creating a missing target
+                               bucket.
+  --max-workers INTEGER RANGE  Maximum number of concurrent S3 operations.
+                               Defaults to a conservative auto value.  [x>=1]
+  --help                       Show this message and exit.
 ```
 
 ## Usage
